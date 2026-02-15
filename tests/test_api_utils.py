@@ -6,15 +6,16 @@ Tests clean_output_text, is_mllm_model, and extract_multimodal_content
 from vllm_mlx/api/utils.py. No MLX dependency.
 """
 
+from vllm_mlx.api.models import ContentPart, ImageUrl, Message
 from vllm_mlx.api.utils import (
+    MLLM_PATTERNS,
+    SPECIAL_TOKENS_PATTERN,
+    _content_to_text,
     clean_output_text,
     extract_multimodal_content,
     is_mllm_model,
     is_vlm_model,
-    MLLM_PATTERNS,
-    SPECIAL_TOKENS_PATTERN,
 )
-from vllm_mlx.api.models import Message, ContentPart, ImageUrl
 
 
 class TestCleanOutputText:
@@ -438,3 +439,156 @@ class TestExtractMultimodalContent:
         processed, images, videos = extract_multimodal_content(messages)
         assert "First part." in processed[0]["content"]
         assert "Second part." in processed[0]["content"]
+
+    def test_assistant_tool_calls_with_list_content(self):
+        """Regression test for issue #61: list content + tool_calls causes TypeError."""
+        messages = [
+            Message(
+                role="assistant",
+                content=[ContentPart(type="text", text="Let me check.")],
+                tool_calls=[
+                    {
+                        "id": "call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "get_weather",
+                            "arguments": '{"city": "Prague"}',
+                        },
+                    }
+                ],
+            )
+        ]
+        result, images, videos = extract_multimodal_content(messages)
+        assert isinstance(result[0]["content"], str)
+        assert "Let me check." in result[0]["content"]
+        assert "get_weather" in result[0]["content"]
+
+    def test_assistant_tool_calls_with_list_content_native(self):
+        """Regression test for issue #61: list content + tool_calls with native format."""
+        messages = [
+            Message(
+                role="assistant",
+                content=[ContentPart(type="text", text="Checking now.")],
+                tool_calls=[
+                    {
+                        "id": "call_2",
+                        "type": "function",
+                        "function": {
+                            "name": "search",
+                            "arguments": '{"q": "test"}',
+                        },
+                    }
+                ],
+            )
+        ]
+        result, images, videos = extract_multimodal_content(
+            messages, preserve_native_format=True
+        )
+        assert isinstance(result[0]["content"], str)
+        assert "Checking now." in result[0]["content"]
+        assert "tool_calls" in result[0]
+
+
+class TestContentToText:
+    """Tests for the _content_to_text helper."""
+
+    def test_none(self):
+        assert _content_to_text(None) == ""
+
+    def test_string(self):
+        assert _content_to_text("hello") == "hello"
+
+    def test_empty_string(self):
+        assert _content_to_text("") == ""
+
+    def test_list_of_content_parts(self):
+        parts = [
+            ContentPart(type="text", text="Hello"),
+            ContentPart(type="text", text="World"),
+        ]
+        assert _content_to_text(parts) == "Hello\nWorld"
+
+    def test_list_of_dicts(self):
+        parts = [
+            {"type": "text", "text": "foo"},
+            {"type": "image_url", "image_url": "http://img"},
+        ]
+        assert _content_to_text(parts) == "foo"
+
+    def test_list_with_no_text_parts(self):
+        parts = [{"type": "image_url", "image_url": "http://img"}]
+        assert _content_to_text(parts) == ""
+
+    def test_empty_list(self):
+        assert _content_to_text([]) == ""
+
+
+class TestGptOssSpecialTokens:
+    """Tests for GPT-OSS channel token handling in utils."""
+
+    def test_pattern_matches_channel_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|channel|>") is not None
+
+    def test_pattern_matches_message_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|message|>") is not None
+
+    def test_pattern_matches_start_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|start|>") is not None
+
+    def test_pattern_matches_return_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|return|>") is not None
+
+    def test_pattern_matches_call_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|call|>") is not None
+
+    def test_clean_output_extracts_final_channel(self):
+        text = (
+            "<|channel|>analysis<|message|>Thinking about it"
+            "<|start|>assistant<|channel|>final<|message|>The answer is 42<|return|>"
+        )
+        result = clean_output_text(text)
+        assert result == "The answer is 42"
+        assert "<|" not in result
+
+    def test_clean_output_final_only(self):
+        text = "<|channel|>final<|message|>Just the answer<|return|>"
+        result = clean_output_text(text)
+        assert result == "Just the answer"
+
+    def test_clean_output_strips_return_token(self):
+        text = "<|channel|>final<|message|>Hello world<|return|>"
+        result = clean_output_text(text)
+        assert "<|return|>" not in result
+        assert result == "Hello world"
+
+    def test_clean_output_no_channel_tokens_passthrough(self):
+        text = "Normal text without any channel tokens."
+        result = clean_output_text(text)
+        assert result == text
+
+    def test_pattern_matches_constrain_token(self):
+        assert SPECIAL_TOKENS_PATTERN.search("<|constrain|>") is not None
+
+    def test_clean_output_constrain_format(self):
+        """Should extract final content from extended constrain format."""
+        text = (
+            "<|channel|>analysis<|message|>Thinking"
+            "<|end|><|channel|>final <|constrain|>JSON<|message|>"
+            '{"hello":"world"}<|return|>'
+        )
+        result = clean_output_text(text)
+        assert result == '{"hello":"world"}'
+        assert "<|constrain|>" not in result
+        assert "<|channel|>" not in result
+
+    def test_clean_output_constrain_final_only(self):
+        """Should handle constrain format with only final channel."""
+        text = '<|channel|>final <|constrain|>JSON<|message|>{"key":"value"}<|return|>'
+        result = clean_output_text(text)
+        assert result == '{"key":"value"}'
+
+    def test_clean_output_no_final_strips_constrain(self):
+        """When no final channel found, constrain tokens should be stripped."""
+        text = "<|channel|>analysis<|message|>Just thinking <|constrain|>something"
+        result = clean_output_text(text)
+        assert "<|constrain|>" not in result
